@@ -3,6 +3,8 @@ import json
 import os
 import random
 import tracemalloc
+import threading
+import psutil
 from typing import Any, Dict, List, Tuple, Union
 import torch
 
@@ -205,43 +207,105 @@ def get_peak_memory_usage():
     Returns the peak memory usage by current cuda device (in MB) if available
     """
     if not torch.cuda.is_available():
-        return None
+        return 0
 
     current_device = torch.cuda.current_device()
     peak_memory = torch.cuda.max_memory_allocated(current_device)
     return peak_memory / (1024 * 1024)
 
 
-class TimeAndMemoryTracker(object):
+class ResourceTracker(object):
     """
     This class serves as a context manager to track time and
     memory allocated by code executed inside it.
     """
 
-    def __init__(self, logger):
+    def __init__(self, logger, monitoring_interval):
         self.logger = logger
+        self.monitor = MemoryMonitor(logger=logger, interval=monitoring_interval)
 
     def __enter__(self):
-        tracemalloc.start()
         self.start_time = time.time()
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()  # Reset CUDA memory stats
-            torch.cuda.empty_cache()  # Clear CUDA cache
-
+        tracemalloc.start()
+        self.monitor.start()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.end_time = time.time()
+        self.monitor.stop()
         _, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
 
-        cpu_memory = peak / (1024 * 1024)
-        cuda_peak = get_peak_memory_usage()
-
         elapsed_time = self.end_time - self.start_time
+        peak_python_memory_mb = peak / 1024**2
+        process_cpu_peak_memory_mb = self.monitor.get_peak_memory_usage()
+        gpu_peak_memory_mb = get_peak_memory_usage()
 
         self.logger.info(f"Execution time: {elapsed_time:.2f} seconds")
-        self.logger.info(f"CPU Memory allocated (peak): {cpu_memory:.2f} MB")
+        self.logger.info(
+            f"Peak Python Allocated Memory: {peak_python_memory_mb:.2f} MB"
+        )
+        self.logger.info(
+            f"Peak CUDA GPU Memory Usage (Incremental): {gpu_peak_memory_mb:.2f} MB"
+        )
+        self.logger.info(
+            f"Peak System RAM Usage (Incremental): {process_cpu_peak_memory_mb:.2f} MB"
+        )
 
-        if cuda_peak:
-            self.logger.info(f"CUDA Memory allocated (peak): {cuda_peak:.2f} MB")
+
+class MemoryMonitor:
+    initial_cpu_memory = None
+    peak_cpu_memory = 0  # Class variable to store peak memory usage
+
+    def __init__(self, interval=20.0, logger=print):
+        self.interval = interval
+        self.logger = logger or print
+        self.running = False
+        self.thread = threading.Thread(target=self.monitor_loop)
+
+    def monitor_memory(self):
+        process = psutil.Process(os.getpid())
+        total_memory = process.memory_info().rss
+
+        # Check if the current memory usage is a new peak and update accordingly
+        self.peak_cpu_memory = max(self.peak_cpu_memory, total_memory)
+        if self.initial_cpu_memory is None:
+            self.initial_cpu_memory = self.peak_cpu_memory
+
+    def monitor_loop(self):
+        """Runs the monitoring process in a loop."""
+        while self.running:
+            self.monitor_memory()
+            time.sleep(self.interval)
+
+    def _schedule_monitor(self):
+        """Internal method to schedule the next execution"""
+        self.monitor_memory()
+        # Only reschedule if the timer has not been canceled
+        if self.timer is not None:
+            self.timer = threading.Timer(self.interval, self._schedule_monitor)
+            self.timer.start()
+
+    def start(self):
+        """Starts the memory monitoring."""
+        if not self.running:
+            self.running = True
+            self.thread.start()
+
+    def stop(self):
+        """Stops the periodic monitoring"""
+        self.running = False
+        self.thread.join()  # Wait for the monitoring thread to finish
+
+    def get_peak_memory_usage(self):
+        # Convert both CPU and GPU memory usage from bytes to megabytes
+        incremental_cpu_peak_memory = (
+            self.peak_cpu_memory - self.initial_cpu_memory
+        ) / (1024**2)
+
+        return incremental_cpu_peak_memory
+
+    @classmethod
+    def get_peak_memory(cls):
+        """Returns the peak memory usage"""
+        return cls.peak_cpu_memory
